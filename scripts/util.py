@@ -1,3 +1,9 @@
+from datasets import load_dataset
+import csv
+import json
+import os
+
+
 def get_batch_size(model_type, gpu_memory, input_length, output_length):
     batch_sizes_same = {
         'mgpt': {
@@ -16,7 +22,7 @@ def get_batch_size(model_type, gpu_memory, input_length, output_length):
             80: {512: 8, 1024: 6, 2048: 2},  # tested 1024 and 2048
         },
         'mt5-large': {
-            24: {512: 0, 1024: 0, 2048: 0},  # tested
+            24: {512: 1, 1024: 0, 2048: 0},  # tested
             48: {512: 1, 1024: 1, 2048: 1},  # never tested
             80: {512: 4, 1024: 2, 2048: 1},  # tested 1024 and 2048
         },
@@ -54,3 +60,87 @@ def get_batch_size(model_type, gpu_memory, input_length, output_length):
         raise KeyError
 
     return batch_size
+
+def average_rouge_scores(rouge_scores_list):
+    avg_scores = {
+        'rouge-1': {'r': 0, 'p': 0, 'f': 0},
+        'rouge-2': {'r': 0, 'p': 0, 'f': 0},
+        'rouge-l': {'r': 0, 'p': 0, 'f': 0}
+    }
+
+    num_scores = len(rouge_scores_list)
+
+    for scores in rouge_scores_list:
+        for rouge_type in avg_scores:
+            for metric in avg_scores[rouge_type]:
+                avg_scores[rouge_type][metric] += scores[rouge_type][metric]
+
+    for rouge_type in avg_scores:
+        for metric in avg_scores[rouge_type]:
+            avg_scores[rouge_type][metric] /= num_scores
+
+    return avg_scores
+
+def average_bert_score(bert_scores):
+    total_precision = 0
+    total_recall = 0
+    total_f1 = 0
+    count = len(bert_scores)
+
+    for bert_score in bert_scores:
+        total_precision += sum(bert_score['precision']) / len(bert_score['precision'])
+        total_recall += sum(bert_score['recall']) / len(bert_score['recall'])
+        total_f1 += sum(bert_score['f1']) / len(bert_score['f1'])
+
+    return {
+        'precision': total_precision / count,
+        'recall': total_recall / count,
+        'f1': total_f1 / count
+    }
+
+
+def export_output(data, output_dir):
+    # Export to CSV
+    # if output_dir doesn't exist, create it
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    with open(f"{output_dir}/output_{output_dir.split('/')[-1]}.csv", mode='w', newline='') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=data[0].keys())
+        writer.writeheader()
+        for row in data:
+            writer.writerow(row)
+
+    # Export to JSONL
+    with open(f"{output_dir}/output_{output_dir.split('/')[-1]}.jsonl", mode='w') as jsonl_file:
+        for row in data:
+            json.dump(row, jsonl_file)
+            jsonl_file.write('\n')
+
+
+def get_datasets(logger, sum="False", origin="False"):
+    # Load dataset
+    if sum == "True":
+        logger.info("Loading summarization dataset")
+        dataset = load_dataset("rcds/swiss_ruling_summarization")
+    else:
+        if origin == "True":
+            logger.info("Loading origin dataset")
+            dataset = load_dataset("rcds/swiss_court_view_generation", "origin")
+        else:
+            logger.info("Loading full dataset")
+            dataset = load_dataset("rcds/swiss_court_view_generation", "main")
+    return dataset['train'], dataset['validation'], dataset['test']
+
+def get_val_dataset(logger, sum="False", origin="False"):
+    # Load dataset
+    if sum == "True":
+        logger.info("Loading summarization dataset (validation)")
+        dataset = load_dataset("rcds/swiss_ruling_summarization", split="validation")
+    else:
+        if origin == "True":
+            logger.info("Loading origin dataset (validation)")
+            dataset = load_dataset("rcds/swiss_court_view_generation", "origin", split="validation")
+        else:
+            logger.info("Loading full dataset (validation)")
+            dataset = load_dataset("rcds/swiss_court_view_generation", "main", split="validation")
+    return dataset

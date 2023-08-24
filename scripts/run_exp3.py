@@ -5,6 +5,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import IntervalStrategy, EarlyStoppingCallback
 
 from scripts.util import get_batch_size
+from scripts.util import average_bert_score, average_rouge_scores, export_output, get_datasets
+
 
 import nltk
 
@@ -163,43 +165,6 @@ def preprocess_function(examples, input_length=args.input_length, output_length=
         "labels": targets["input_ids"].tolist(),
     }
 
-def average_rouge_scores(rouge_scores_list):
-    avg_scores = {
-        'rouge-1': {'r': 0, 'p': 0, 'f': 0},
-        'rouge-2': {'r': 0, 'p': 0, 'f': 0},
-        'rouge-l': {'r': 0, 'p': 0, 'f': 0}
-    }
-
-    num_scores = len(rouge_scores_list)
-
-    for scores in rouge_scores_list:
-        for rouge_type in avg_scores:
-            for metric in avg_scores[rouge_type]:
-                avg_scores[rouge_type][metric] += scores[rouge_type][metric]
-
-    for rouge_type in avg_scores:
-        for metric in avg_scores[rouge_type]:
-            avg_scores[rouge_type][metric] /= num_scores
-
-    return avg_scores
-
-def average_bert_score(bert_scores):
-    total_precision = 0
-    total_recall = 0
-    total_f1 = 0
-    count = len(bert_scores)
-
-    for bert_score in bert_scores:
-        total_precision += sum(bert_score['precision']) / len(bert_score['precision'])
-        total_recall += sum(bert_score['recall']) / len(bert_score['recall'])
-        total_f1 += sum(bert_score['f1']) / len(bert_score['f1'])
-
-    return {
-        'precision': total_precision / count,
-        'recall': total_recall / count,
-        'f1': total_f1 / count
-    }
-
 output_examples = []
 
 def compute_scores(test_data, model, tokenizer, num_examples=100):
@@ -303,20 +268,6 @@ def load_model(model_name, tokenizer_name):
         raise ValueError(f"Model {model_name} not supported")
     return model, tokenizer
 
-def get_datasets():
-    # Load dataset
-    if args.sum == "True":
-        logger.info("Loading summarization dataset")
-        dataset = load_dataset("rcds/swiss_ruling_summarization")
-    else:
-        if args.origin == "True":
-            logger.info("Loading origin dataset")
-            dataset = load_dataset("rcds/swiss_court_view_generation", "origin")
-        else:
-            logger.info("Loading full dataset")
-            dataset = load_dataset("rcds/swiss_court_view_generation", "full")
-    return dataset['train'], dataset['validation'], dataset['test']
-
 def log_test_scores(meteor_score_avg, rouge_score_avg, bleu_score_avg, bert_score_avg):
     wandb.log({
         "METEOR_score/test": meteor_score_avg,
@@ -362,22 +313,6 @@ def log_duration(start_time, end_time_train, end_time):
                "time_taken_train": time_taken_train_minutes,
                "time_taken_test": time_taken_eval_minutes})
 
-
-def export_output(data):
-    # Export to CSV
-    with open(f"{output_dir}/output_{output_dir.split('/')[-1]}.csv", mode='w', newline='') as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=data[0].keys())
-        writer.writeheader()
-        for row in data:
-            writer.writerow(row)
-
-    # Export to JSONL
-    with open(f"{output_dir}/output_{output_dir.split('/')[-1]}.jsonl", mode='w') as jsonl_file:
-        for row in data:
-            json.dump(row, jsonl_file)
-            jsonl_file.write('\n')
-
-
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         labels = inputs.pop("labels")
@@ -406,7 +341,7 @@ model.config.pad_token_id = tokenizer.pad_token_id
 model.config.eos_token_id = tokenizer.eos_token_id
 
 
-train_dataset, eval_dataset, test_dataset = get_datasets()
+train_dataset, eval_dataset, test_dataset = get_datasets(args.sum, args.origin, logger)
 
 # Update args values with the full lengths of the dataset splits if the args values are -1
 if args.train_size == -1:
@@ -473,8 +408,8 @@ training_args = TrainingArguments(
     greater_is_better=False,
     logging_dir="logs",
     report_to="wandb",
-    bf16=True,
-    bf16_full_eval=True,
+    bf16=False,
+    bf16_full_eval=False,
 )
 
 trainer = CustomTrainer(
@@ -513,7 +448,7 @@ log_test_scores(meteor_score_avg, rouge_score_avg, bleu_score_avg, bert_score_av
 
 try:
     # save output examples to file
-    export_output(output_examples)
+    export_output(output_examples, output_dir)
 except Exception as e:
     logger.info("Error exporting output examples: " + str(e))
 
