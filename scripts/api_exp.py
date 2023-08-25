@@ -1,23 +1,13 @@
-from datasets import load_dataset
-import os
 import openai
 import tiktoken
 
-from scripts.util import get_batch_size
-from scripts.util import average_bert_score, average_rouge_scores, export_output, get_val_dataset
-
-import nltk
-
-nltk.download('wordnet')
+from scripts.util import average_bert_score, average_rouge_scores, export_output, get_val_dataset, truncate_text, number_of_tokens, tokenize
 
 import os
-import torch
 from nltk.translate import meteor_score
 import numpy as np
 import argparse
 import wandb
-import json
-import csv
 
 from nltk.translate.bleu_score import corpus_bleu, sentence_bleu
 from rouge import Rouge
@@ -66,13 +56,6 @@ def log_test_scores(meteor_score_avg, rouge_score_avg, bleu_score_avg, bert_scor
     logger.info(f"Average BERTScore: {bert_score_avg}")
     print()
 
-def tokenize(text, tokenizer = "whitespace"):
-    if tokenizer == "tiktoken":
-        enc = tiktoken.encoding_for_model("gpt-4")
-        return enc.encode(text) ## list of tokens
-    elif tokenizer == "whitespace":
-        return text.split(" ")
-
 def compute_scores(completion_dataset, num_examples=100):
     scores = {'meteor': [], 'rouge': [], 'bleu': [], 'bert': []}
     rouge = Rouge()
@@ -89,8 +72,8 @@ def compute_scores(completion_dataset, num_examples=100):
         tokenized_target_text: string (tokens)
         tokenized_predicted_text: string (tokens)
         """
-        target_text_tokens = tokenize(entry['target'])
-        predicted_text_tokens = tokenize(entry['predicted'])
+        target_text_tokens = tokenize(entry['target'], model_name)
+        predicted_text_tokens = tokenize(entry['predicted'], model_name)
 
         predicted_text = entry['predicted']
         target_text = entry['target']
@@ -116,6 +99,8 @@ def compute_scores(completion_dataset, num_examples=100):
         scores['bert'].append(bert)
 
         output_examples.append({
+            'language': entry['lang'],
+            'input': entry['input'],
             'target': target_text,
             'predicted': predicted_text,
             'meteor': meteor,
@@ -147,6 +132,84 @@ def compute_scores(completion_dataset, num_examples=100):
     return np.mean(scores['meteor']), average_rouge_scores(scores['rouge']), np.mean(
         scores['bleu']), average_bert_score(scores['bert'])
 
+def prepare_dataset(dataset, input_len, output_len, sum, origin):
+    """
+       if args.origin is "True": it takes origin_facts and origin_considerations as input
+       else: it takes facts and considerations as input except specific input_col_name and target_col_name are given as arguments
+       """
+    if sum == "True":
+        input_col_name = "text"
+        target_col_name = "regeste"
+    if sum == "False":
+        input_col_name = "facts"
+        target_col_name = "considerations"
+    if origin == "True":
+        raise NotImplementedError("Origin not implemented yet")
+
+    data_list = [{"input": i, "target": t, "lang": lang} for i, t, lang in zip(dataset[input_col_name], dataset[target_col_name], dataset["language"])]
+
+    # truncate input and target to input_len and output_len words:
+    # but join input and target first, so that we can truncate them together
+    for i in range(len(data_list)):
+        data_list[i]["input"] = truncate_text(data_list[i]["input"], input_len, model_name)
+        data_list[i]["target"] = truncate_text(data_list[i]["target"], output_len, model_name)
+
+
+    # we want to return a list of dicts with the keys "input" and "target"
+    return data_list
+
+def create_instruction(input, lang, task):
+    """
+    Creates the instruction for the API completion
+    """
+    if task == "cvg":
+        if lang == 'de':
+            instruction = f'Ziel: Generiere Erwägungen basierend auf dem gegebenen Sachverhalt eines Schweizer Gerichtsurteils.\nHintergrund: Ein Schweizer Gerichtsurteil besteht aus Rubrum, Sachverhalt, Erwägungen, Dispositiv (Urteilsformel) und Unterschrift. Die Erwägungen sind die rechtliche Würdigung des Geschehens durch das Gericht.\nAnweisung:\n-Sachverhalt Verstehen: Der gegebene Sachverhalt enthält bestrittene und unbestrittene Fakten, die Begehren der Parteien, das Beweisverfahren und die Prozessgeschichte.\n-Beginne mit Prozessvoraussetzungen: Prüfe zunächst, ob die Prozessvoraussetzungen (z.B. Zuständigkeit des Gerichts) erfüllt sind. Wenn nicht strittig, reicht es aus zu bestätigen, dass die Voraussetzungen erfüllt sind.\n-Rechtliche Würdigung:\nEruieren Sie relevante Rechtssätze basierend auf den behaupteten und rechtlich relevanten Tatsachen.\n-Setzen Sie sich mit den rechtlichen Standpunkten der Parteien auseinander.\n-Beachten Sie die Beweislastverteilung und würdigen Sie die Beweise frei, aber berücksichtigen Sie relevante gesetzliche Beweisregeln.\n-Iura novit curia: Ihre rechtliche Würdigung muss nicht zwangsläufig dem rechtlichen Vorbringen der Parteien entsprechen. Berücksichtigen Sie andere mögliche Argumentationslinien.\n-Zusammenfassung: Fassen Sie am Ende Ihrer Erwägungen das Ergebnis Ihrer rechtlichen Würdigung zusammen.\n-Output: Der generierte Text sollte strukturiert, klar und in der Form von typischen Erwägungen eines Schweizer Gerichtsurteils sein.\n\nSachverhalt des Schweizer Gerichtsurteils:\n\n{input}\n\nErwägungen:\n\n'
+        elif lang == 'fr':
+            instruction = f"But: Générer des considérations basées sur les faits donnés d'un jugement suisse.\nContexte: Un jugement suisse est composé du rubrum, des faits, des considérations, du dispositif (formule du jugement) et de la signature. Les considérations sont l'appréciation juridique des événements par le tribunal.\nInstructions:\n- Comprendre les faits: Les faits donnés contiennent des faits contestés et non contestés, les demandes des parties, la procédure de preuve et l'historique du procès.\n- Commencer par les conditions de procédure: Vérifiez d'abord si les conditions de procédure (par exemple, la compétence du tribunal) sont remplies. Si cela n'est pas contesté, il suffit de confirmer que les conditions sont remplies.\n- Appréciation juridique:\nÉvaluez les dispositions juridiques pertinentes basées sur les faits allégués et juridiquement pertinents.\n- Confrontez-vous aux points de vue juridiques des parties.\n- Tenez compte de la répartition de la charge de la preuve et évaluez les preuves librement, mais tenez compte des règles légales de preuve pertinentes.\n- Iura novit curia: Votre appréciation juridique ne doit pas nécessairement correspondre aux arguments juridiques présentés par les parties. Considérez d'autres lignes d'argumentation possibles.\n- Résumé: Résumez à la fin de vos considérations le résultat de votre appréciation juridique.\n- Résultat: Le texte généré devrait être structuré, clair et sous la forme de considérations typiques d'un jugement suisse.\n\nFaits du jugement suisse:\n\n{input}\n\nConsidérations:\n\n"
+        elif lang == 'it':
+            instruction = f"Obiettivo: Generare considerazioni basate sui fatti presentati in una sentenza svizzera.\nContesto: Una sentenza svizzera si compone di rubrum, fatti, considerazioni, dispositivo (formula della sentenza) e firma. Le considerazioni rappresentano la valutazione giuridica degli eventi da parte del tribunale.\nIstruzioni:\n- Comprendere i fatti: I fatti presentati includono fatti contestati e non contestati, le richieste delle parti, la procedura probatoria e la storia del processo.\n- Iniziare con le condizioni processuali: Verificare prima di tutto se le condizioni processuali (ad es. la competenza del tribunale) sono soddisfatte. Se non contestate, è sufficiente confermare che le condizioni sono state soddisfatte.\n- Valutazione giuridica:\nValutare le norme giuridiche rilevanti in base ai fatti affermati e giuridicamente rilevanti.\n- Confrontarsi con i punti di vista giuridici delle parti.\n- Tenere conto della distribuzione dell'onere della prova e valutare le prove liberamente, ma considerare le regole di prova legalmente rilevanti.\n- Iura novit curia: La tua valutazione giuridica non deve necessariamente corrispondere alle argomentazioni giuridiche delle parti. Considera altre possibili linee di argomentazione.\n- Riassunto: Riassumere alla fine delle tue considerazioni il risultato della tua valutazione giuridica.\n- Risultato: Il testo generato dovrebbe essere strutturato, chiaro e nella forma di considerazioni tipiche di una sentenza svizzera.\n\nFatti della sentenza svizzera:\n\n{input}\n\nConsiderazioni:\n\n"
+    elif task == 'summ':
+        instruction = f"Ziel: Generiere eine Regeste basierend auf dem gegebenen Sachverhalt, Erwägungen und Dispositiv eines Schweizer Gerichtsurteils.\nHintergrund: Ein Schweizer Gerichtsurteil besteht aus Sachverhalt, Erwägungen und Dispositiv. Die Regeste dient als Kurzzusammenfassung einer gerichtlichen Entscheidung mit Leitsätzen.\nAnweisung:\n1. Sachverhalt: Überprüfe den Sachverhalt.\n2. Erwägungen: Analysiere die Erwägungen.\n3. Dispositiv: Berücksichtige das Dispositiv.\n4. Erstelle die Regeste: Fasse den Fall in Leitsätzen zusammen.\nOutput: Die Regeste sollte eine klare Kurzzusammenfassung mit Leitsätzen bieten.\n\nGegebener Sachverhalt, Erwägungen und Dispositiv:\n\n{input}\n\nGeneriere nun die kurze Regeste.\n\nRegeste:\n\n"
+
+    else:
+        raise NotImplementedError("Task not implemented yet")
+    return instruction
+
+def generate_completions(dataset, input_length, output_length, model):
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+    dataset_with_predicted = []
+    logger.info("Using model: " + model)
+    if len(dataset) > 50:
+        input("Are you sure you want to generate completions for " + str(len(dataset)) + " examples? Press Enter to continue...")
+    if len(dataset) > 100:
+        input("Are you really sure? Press Enter to continue...")
+
+    for entry in dataset:
+        instruct = create_instruction(entry["input"], entry["lang"], task_name)
+        # measure time to generate completion
+        start = time.time()
+        completion = openai.ChatCompletion.create(
+            model=model,
+            messages=[
+                {"role": "user", "content": instruct}
+                ],
+            max_tokens=output_length,
+            )
+        end = time.time()
+        logger.info("Time to generate completion: " + str(end - start))
+        print(completion)
+        predicted = completion.choices[0].message["content"]
+        entry_with_predicted = {"input": entry["input"], "target": entry["target"], "predicted": predicted, "lang": entry["lang"]}
+        dataset_with_predicted.append(entry_with_predicted)
+
+    return dataset_with_predicted
+
+
+########################################################################################################################
+
+# measure time for whole script
+start = time.time()
 
 logger = setup_logger()
 
@@ -184,16 +247,27 @@ seed = 42
 eval_dataset = eval_dataset.shuffle(seed).select(range(args.eval_size))
 
 project_name = "summarization" if args.sum == "True" else "court view generation"
+
+if args.sum == "True":
+    task_name = "summ"
+elif args.origin == "True":
+    task_name = "cvg-origin"
+else:
+    task_name = "cvg"
+
+
 logger.info("Project name: " + project_name)
 os.environ["WANDB_PROJECT"] = project_name
 os.environ["WANDB_RUN_GROUP"] = f"{model_name}, {len(eval_dataset)}"
 
 # add train size, seq length to output dir
-output_dir = f"output/{args.model.split('/')[-1]}_inlen={args.input_length}_outlen={args.output_length}_origin={args.origin}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')}"
+output_dir = f"output/{task_name}/{args.model.split('/')[-1]}_evalsize={args.eval_size}_inlen={args.input_length}_outlen={args.output_length}_origin={args.origin}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')}"
 # set wandb run name
 wandb.init(name=output_dir.split('/')[-1]) # means
 # log output dir to wandb
 wandb.log({"output_dir": output_dir})
+# log task name to wandb
+wandb.log({"task_name": task_name})
 
 logger.info("Model name:" + model_name + " finetune: " + " output_dir: " + output_dir)
 logger.info("Eval dataset size: " + str(len(eval_dataset)) )
@@ -203,79 +277,11 @@ wandb.config.update(args)
 
 output_examples = []
 
-# TODO: komplett anpassen an dataset format, für api completions
-# TODO: trennen in eine funktion für generation und eine für evaluation
-
-def prepare_dataset(dataset, input_len, output_len, sum, origin):
-    """
-       if args.origin is "True": it takes origin_facts and origin_considerations as input
-       else: it takes facts and considerations as input except specific input_col_name and target_col_name are given as arguments
-       """
-    if sum == "True":
-        input_col_name = "text"
-        target_col_name = "regeste"
-    if sum == "False":
-        input_col_name = "facts"
-        target_col_name = "considerations"
-    if origin == "True":
-        raise NotImplementedError("Origin not implemented yet")
-
-    data_list = [{"input": i, "target": t, "lang": lang} for i, t, lang in zip(dataset[input_col_name], dataset[target_col_name], dataset["language"])]
-
-    # truncate input and target to input_len and output_len words:
-    # but join input and target first, so that we can truncate them together
-    for i in range(len(data_list)):
-        data_list[i]["input"] = " ".join(data_list[i]["input"].split()[:int(input_len/3)])
-        data_list[i]["target"] = " ".join(data_list[i]["target"].split()[:output_len])
-
-
-    # we want to return a list of dicts with the keys "input" and "target"
-    return data_list
-
 # prepare dataset for generation
 eval_data = prepare_dataset(eval_dataset, args.input_length, args.output_length, args.sum, args.origin)
 
-def create_instruction(input, task="court_view_generation", lang='en'):
-    """
-    Creates the instruction for the API completion
-    """
-    if task == "court_view_generation":
-        if lang == 'en':
-            instruction = f"'Given the following facts:'\n'{input}'\n'Write the considerations of the court.'\n'Considerations:'\n'"
-        elif lang == 'de':
-            instruction = f"'Gegeben sind folgende Sachverhalte:'\n'{input}'\n'Schreiben Sie die Erwägungen des Gerichts.'\n'Erwägungen:'\n'"
-        elif lang == 'fr':
-            instruction = f"'Étant donné les faits suivants:'\n'{input}'\n'Écrivez les considérations du tribunal.'\n'Considérations:'\n'"
-        elif lang == 'it':
-            instruction = f"'Dati i seguenti fatti:'\n'{input}'\n'Scrivere le considerazioni del tribunale.'\n'Considerazioni:'\n'"
-    else:
-        raise NotImplementedError("Task not implemented yet")
-    return instruction
-
-def generate_completions(dataset, input_length, output_length, model='gpt-3.5-turbo'):
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    dataset_with_predicted = []
-
-    for entry in dataset[:20]:
-        instruct = create_instruction(entry["input"], lang=entry["lang"])
-        completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "user", "content": instruct}
-                ],
-            max_tokens=output_length,
-            )
-        print(completion)
-        predicted = completion.choices[0].message["content"]
-        entry_with_predicted = {"input": entry["input"], "target": entry["target"], "predicted": predicted}
-        dataset_with_predicted.append(entry_with_predicted)
-
-    return dataset_with_predicted
-
-
 # generate output examples using API completions
-completion_dataset = generate_completions(eval_data, args.input_length, args.output_length)
-
+completion_dataset = generate_completions(eval_data, args.input_length, args.output_length, model_name)
 
 # Evaluate model on test dataset
 meteor_score_avg, rouge_score_avg, bleu_score_avg, bert_score_avg = compute_scores(completion_dataset)
@@ -285,6 +291,11 @@ log_test_scores(meteor_score_avg, rouge_score_avg, bleu_score_avg, bert_score_av
 
 try:
     # save output examples to file
-    export_output(output_examples, output_dir)
+    export_output(output_examples, output_dir, task_name)
 except Exception as e:
     logger.info("Error exporting output examples: " + str(e))
+
+# measure time for whole script
+end = time.time()
+# in readable format
+logger.info("Time for whole script: " + str(datetime.timedelta(seconds=end - start)))

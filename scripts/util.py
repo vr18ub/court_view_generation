@@ -2,6 +2,7 @@ from datasets import load_dataset
 import csv
 import json
 import os
+import tiktoken
 
 
 def get_batch_size(model_type, gpu_memory, input_length, output_length):
@@ -130,22 +131,25 @@ def average_bert_score(bert_scores):
     }
 
 
-def export_output(data, output_dir):
+def export_output(data, output_dir, task_name):
     # Export to CSV
     # if output_dir doesn't exist, create it
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    with open(f"{output_dir}/output_{output_dir.split('/')[-1]}.csv", mode='w', newline='') as csv_file:
+    with open(f"{output_dir}/{task_name}_{output_dir.split('/')[-1]}.csv", mode='w', newline='') as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=data[0].keys())
         writer.writeheader()
         for row in data:
             writer.writerow(row)
+    print(f"Output saved to {output_dir}/output_{output_dir.split('/')[-1]}.csv")
 
     # Export to JSONL
-    with open(f"{output_dir}/output_{output_dir.split('/')[-1]}.jsonl", mode='w') as jsonl_file:
+    with open(f"{output_dir}/{task_name}_{output_dir.split('/')[-1]}.jsonl", mode='w') as jsonl_file:
         for row in data:
             json.dump(row, jsonl_file)
             jsonl_file.write('\n')
+    print(f"Output saved to {output_dir}/output_{output_dir.split('/')[-1]}.jsonl")
+
 
 
 def get_datasets(logger, sum="False", origin="False"):
@@ -158,7 +162,7 @@ def get_datasets(logger, sum="False", origin="False"):
             logger.info("Loading origin dataset")
             dataset = load_dataset("rcds/swiss_court_view_generation", "origin")
         else:
-            logger.info("Loading full dataset")
+            logger.info("Loading cvg dataset")
             dataset = load_dataset("rcds/swiss_court_view_generation", "main")
     return dataset['train'], dataset['validation'], dataset['test']
 
@@ -175,3 +179,25 @@ def get_val_dataset(logger, sum="False", origin="False"):
             logger.info("Loading full dataset (validation)")
             dataset = load_dataset("rcds/swiss_court_view_generation", "main", split="validation")
     return dataset
+
+def truncate_text(text, max_tokens, tokenizer):
+    enc = tiktoken.get_encoding("cl100k_base")
+    enc = tiktoken.encoding_for_model(tokenizer)
+    text_token_ids = enc.encode(text)
+    if len(text_token_ids) > max_tokens:
+        text_token_ids = text_token_ids[:max_tokens]
+    return enc.decode(text_token_ids)
+
+def number_of_tokens(text, tokenizer):
+    enc = tiktoken.get_encoding("cl100k_base")
+    enc = tiktoken.encoding_for_model(tokenizer)
+    return len(enc.encode(text))
+
+def tokenize(text, tokenizer):
+    enc = tiktoken.get_encoding("cl100k_base")
+    enc = tiktoken.encoding_for_model(tokenizer)
+    print("loading tokenizer for model: ", tokenizer)
+    text_token_ids = enc.encode(text)
+    # we want a list text_tokens with applying enc.decode([x]) for each x in text_token_ids
+    text_tokens = [enc.decode([x]) for x in text_token_ids]
+    return text_tokens ## list of tokens
