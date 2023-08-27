@@ -282,3 +282,5 @@ def prepare_dataset(dataset, input_len, output_len, sum, origin, model_name):
     for i in range(len(data_list)):
         data_list[i]["input"] = truncate_text(data_list[i]["input"], input_len, model_name)
         data_list[i]["target"] = truncate_text(data_list[i]["target"], output_len, model_name)
+
+    return data_list
